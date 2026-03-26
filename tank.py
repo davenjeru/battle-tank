@@ -17,10 +17,11 @@ from history import GameRecorder, build_history_prompt
 MCP_URL = "https://battle-tank-arena.vercel.app/api/mcp"
 TANK_NAME = os.getenv("TANK_NAME", "Squad4")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-POLL_INTERVAL = 2  # seconds between game-state polls
+LOBBY_POLL_INTERVAL = 30  # seconds between polls while in lobby
+POLL_INTERVAL = 2         # seconds between polls during gameplay
 
 SYSTEM_PROMPT = """\
-You are an autonomous battle-tank AI competing in Battle Tank Arena (20×20 grid).
+You are an autonomous battle-tank AI competing in Battle Tank Arena (20x20 grid).
 Your tank is named "{tank_name}".
 
 ## Rules
@@ -73,8 +74,11 @@ async def run_bot() -> None:
         params={
             "url": MCP_URL,
             "headers": {"x-player-token": TANK_NAME},
+            "timeout": 30,
         },
+        client_session_timeout_seconds=30,
         cache_tools_list=True,
+        max_retry_attempts=3,
     ) as server:
         # ── Phase 1: Register ──────────────────────────────────────
         print("[bot] Registering tank …")
@@ -98,7 +102,7 @@ async def run_bot() -> None:
             try:
                 state_result = await server.call_tool("get_game_state", {})
                 state = _parse_tool_result(state_result)
-            except Exception as e:
+            except BaseException as e:
                 print(f"[bot] Error polling state: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
@@ -124,7 +128,7 @@ async def run_bot() -> None:
 
             if status == "lobby":
                 print("[bot] Still in lobby …", end="\r")
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(LOBBY_POLL_INTERVAL)
                 continue
 
             # status == "running"
