@@ -1,0 +1,9 @@
+[project]
+name = "battle-tank"
+version = "0.1.0"
+description = "AI-powered battle tank bot for Battle Tank Arena"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai-agents>=0.13.1",
+]
