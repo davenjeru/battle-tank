@@ -4,3 +4,4 @@ __pycache__/
 .env
 games/
 .python-version
+railway_logs_latest.txt

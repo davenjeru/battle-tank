@@ -11,14 +11,21 @@ from typing import Any
 from agents import Agent, Runner
 from agents.mcp import MCPServerStreamableHttp
 from agents.model_settings import ModelSettings
+from dotenv import load_dotenv
 
-from history import GameRecorder, build_history_prompt
+load_dotenv(override=True)
 
 MCP_URL = "https://battle-tank-arena.vercel.app/api/mcp"
 TANK_NAME = os.getenv("TANK_NAME", "Squad4")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "25"))
 LOBBY_POLL_INTERVAL = 30  # seconds between polls while in lobby
 POLL_INTERVAL = 2         # seconds between polls during gameplay
+
+# MCP / HTTP timeouts (seconds) — Vercel cold starts + busy turns need headroom
+MCP_HTTP_TIMEOUT = float(os.getenv("MCP_HTTP_TIMEOUT", "90"))
+MCP_SSE_READ_TIMEOUT = float(os.getenv("MCP_SSE_READ_TIMEOUT", "600"))
+MCP_SESSION_TIMEOUT = float(os.getenv("MCP_SESSION_TIMEOUT", "90"))
 
 SYSTEM_PROMPT = """\
 You are an autonomous battle-tank AI competing in Battle Tank Arena (20x20 grid).
@@ -31,22 +38,33 @@ Your tank is named "{tank_name}".
 - **fire(die=1|2)** — shoot that die's value cells in your facing direction. Costs the die.
 - A hit removes 1 HP from the target. Tanks start at 5 HP; 0 = eliminated.
 
+## Firing discipline (mandatory)
+- Call **get_valid_actions** and treat its JSON as the **only** source of truth for hits.
+- For each unused die, **validShots** lists directions (after you face that way) and what the shot
+  would land on. A **guaranteed hit** is when the entry for that direction is a **non-null enemy
+  tank name** (a string), not `null` and not missing.
+- You may call **fire(die=N)** **only** if: you have already **rotate**d so your facing direction
+  matches a direction where, in the **latest** get_valid_actions response for die N, that shot's
+  target is a **non-null enemy name**. Do **not** fire if the only available targets are `null`
+  (miss) when you could **move** that die instead.
+- If an unused die has **no** direction with a non-null hit in get_valid_actions, use **move**
+  for that die (after **rotate** to a direction listed in **validMoves** for that die), not fire.
+- If and only if **move** is impossible for an unused die and every legal shot for that die is a
+  miss (`null`), you may fire to spend the die (last resort).
+
 ## Your turn procedure
-1. Call **get_valid_actions** FIRST. It tells you your dice values, position, enemies, and
-   exactly which shots will hit (target != null) vs miss (target == null).
-2. Look for any rotation where a fire action would HIT an enemy. Prioritise kills.
-3. If no shot can hit, reposition: move toward the nearest enemy or toward the grid center.
-4. After using die 1, re-evaluate — rotate again if needed, then use die 2.
-5. ALWAYS consume both dice. Never end your turn with an unused die.
+1. Call **get_valid_actions** first.
+2. Plan both dice: prefer **fire** only where the JSON shows a non-null target; otherwise **move**.
+3. After spending one die, call **get_valid_actions** again before spending the second (dice /
+   board state change).
+4. ALWAYS consume both dice. Never end your turn with an unused die.
 
 ## Strategy
-- Shots that hit are always better than moves. Take every hit you can.
-- If both dice can hit (possibly after rotating), fire both.
-- If only one can hit, fire that one and move with the other to improve next-turn position.
-- Prefer the center of the grid — edges limit your rotation options.
-- When no hits are available, close distance to the nearest enemy.
+- Prioritize lowest-HP enemies when choosing among guaranteed hits.
+- If both dice can hit (after rotates), fire both.
+- If only one can hit, fire that one and **move** with the other when no second hit exists.
+- Prefer positions toward the grid center when moving.
 
-{history}
 """
 
 
@@ -64,8 +82,7 @@ def _find_our_tank(tanks: dict[str, Any], name: str) -> tuple[str, dict[str, Any
 
 
 async def run_bot() -> None:
-    history_context = build_history_prompt()
-    prompt = SYSTEM_PROMPT.format(tank_name=TANK_NAME, history=history_context)
+    prompt = SYSTEM_PROMPT.format(tank_name=TANK_NAME)
 
     print(f"[bot] Connecting as '{TANK_NAME}' to {MCP_URL}")
 
@@ -74,9 +91,10 @@ async def run_bot() -> None:
         params={
             "url": MCP_URL,
             "headers": {"x-player-token": TANK_NAME},
-            "timeout": 30,
+            "timeout": MCP_HTTP_TIMEOUT,
+            "sse_read_timeout": MCP_SSE_READ_TIMEOUT,
         },
-        client_session_timeout_seconds=30,
+        client_session_timeout_seconds=MCP_SESSION_TIMEOUT,
         cache_tools_list=True,
         max_retry_attempts=3,
     ) as server:
@@ -84,7 +102,8 @@ async def run_bot() -> None:
         print("[bot] Registering tank …")
         try:
             reg = await server.call_tool("register", {"name": TANK_NAME})
-            print(f"[bot] Registration: {reg.content[0].text}")
+            txt = reg.content[0].text
+            print(f"[bot] Registration: {txt}")
         except Exception as e:
             msg = str(e)
             if "already" in msg.lower():
@@ -95,7 +114,6 @@ async def run_bot() -> None:
 
         # ── Phase 2: Wait for game start ───────────────────────────
         print("[bot] Waiting for game to start …")
-        recorder = GameRecorder(TANK_NAME)
         players_recorded = False
 
         while True:
@@ -119,10 +137,8 @@ async def run_bot() -> None:
                     result = "win" if our["score"] == best_score else "loss"
                     if our["score"] <= 0:
                         result = "eliminated"
-                    recorder.finish_game(result, tanks)
-                    print(f"[bot] Result: {result}  |  Final scores: {recorder.final_scores}")
+                    print(f"[bot] Result: {result}")
                 else:
-                    recorder.finish_game("eliminated", tanks)
                     print("[bot] We were eliminated.")
                 break
 
@@ -134,13 +150,11 @@ async def run_bot() -> None:
             # status == "running"
             tanks = state.get("tanks", {})
             if not players_recorded:
-                recorder.record_players(tanks)
                 players_recorded = True
 
             match = _find_our_tank(tanks, TANK_NAME)
             if not match:
                 print("[bot] Our tank is not in the game — eliminated?")
-                recorder.finish_game("eliminated", tanks)
                 break
 
             our_id, our_tank = match
@@ -152,7 +166,6 @@ async def run_bot() -> None:
 
             # ── Phase 3: It's our turn — let the agent play ────────
             print(f"\n[bot] === OUR TURN (score={our_tank['score']}) ===")
-            turn = recorder.start_turn()
 
             agent = Agent(
                 name="TankAgent",
@@ -164,46 +177,23 @@ async def run_bot() -> None:
 
             turn_msg = (
                 f"It's your turn. You are '{TANK_NAME}'. "
-                "Call get_valid_actions now, then make your moves. Use BOTH dice."
+                "Call get_valid_actions now, then make your moves. Use BOTH dice. "
+                "Follow firing discipline: fire only when that die+direction shows a non-null enemy target in get_valid_actions; otherwise move."
             )
 
             try:
-                result = await Runner.run(agent, turn_msg)
-
-                # Record actions from the run
-                for item in result.new_items:
-                    if hasattr(item, "raw_item") and hasattr(item.raw_item, "name"):
-                        action_name = item.raw_item.name
-                        action_args = getattr(item.raw_item, "arguments", "{}")
-                        if isinstance(action_args, str):
-                            try:
-                                action_args = json.loads(action_args)
-                            except json.JSONDecodeError:
-                                action_args = {"raw": action_args}
-
-                        action_output = ""
-                        if hasattr(item, "output"):
-                            action_output = item.output or ""
-
-                        if action_name == "get_valid_actions":
-                            try:
-                                turn.record_valid_actions(json.loads(action_output))
-                            except (json.JSONDecodeError, TypeError):
-                                turn.record_valid_actions({"raw": str(action_output)})
-                        else:
-                            try:
-                                res = json.loads(action_output)
-                            except (json.JSONDecodeError, TypeError):
-                                res = {"raw": str(action_output)}
-                            turn.record_action(
-                                action_name,
-                                action_args if isinstance(action_args, dict) else {},
-                                res,
-                            )
-
+                result = await Runner.run(agent, turn_msg, max_turns=AGENT_MAX_TURNS)
                 print(f"[bot] Agent finished: {result.final_output}")
+            except asyncio.CancelledError:
+                # MCP/tool stack timed out or closed the anyio cancel scope — don’t kill the bot
+                print(
+                    "[bot] Agent run cancelled (usually MCP slow/timeout). "
+                    "Skipping turn recording; will poll again …"
+                )
+            except TimeoutError as e:
+                print(f"[bot] Agent timeout: {e}")
             except Exception as e:
-                print(f"[bot] Agent error: {e}")
+                print(f"[bot] Agent error: {type(e).__name__}: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
 
